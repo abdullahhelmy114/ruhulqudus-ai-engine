@@ -37,7 +37,7 @@ async def embed_chunks(req: EmbedRequest):
                 
             # 🚀 تم تغيير النموذج إلى النسخة الأكثر استقراراً في جوجل
             result = genai.embed_content(
-                model="models/text-embedding-004",
+                model="models/text-embedding-001",
                 content=chunk
             )
 
