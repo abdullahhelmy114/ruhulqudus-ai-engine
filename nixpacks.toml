@@ -1,8 +1,14 @@
+# إعدادات Nixpacks لخدمة Python
 [phases.setup]
-nixPkgs = ["python311", "gcc"]
+nixpkgs = "nixos-unstable"
 
 [phases.install]
-cmds = ["python -m venv /opt/venv", ". /opt/venv/bin/activate", "pip install --no-cache-dir -r requirements.txt"]
+cmds = [
+    "pip install -r requirements.txt"
+]
+
+[phases.build]
+cmds = []
 
 [start]
 cmd = "uvicorn main:app --host 0.0.0.0 --port 8000"
