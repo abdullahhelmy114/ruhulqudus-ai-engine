@@ -102,19 +102,22 @@ async def generate_from_pdf(
         raise HTTPException(status_code=400, detail="يجب رفع ملف PDF")
     
     # 1. استخراج النص من PDF
-    try:
-        pdf_bytes = await file.read()
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            full_text = ""
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
-        if len(full_text.strip()) < 100:
-            raise HTTPException(status_code=400, detail="النص المستخرج قصير جداً (أقل من 100 حرف)")
-    except Exception as e:
-        traceback.print_exc()  # يطبع الخطأ في السجلات
-        raise HTTPException(status_code=500, detail=f"فشل استخراج النص: {str(e)}")
+try:
+    pdf_bytes = await file.read()
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        full_text = ""
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
+    # تسجيل النص المستخرج للتشخيص
+    print(f"[PDF Extract] Total chars: {len(full_text.strip())}")
+    print(f"[PDF Extract] First 200 chars: {full_text.strip()[:200]}")
+    if len(full_text.strip()) < 100:
+        raise HTTPException(status_code=400, detail="النص المستخرج قصير جداً (أقل من 100 حرف)")
+except Exception as e:
+    traceback.print_exc()
+    raise HTTPException(status_code=500, detail=f"فشل استخراج النص: {str(e)}")
     
     # 2. تشغيل وكلاء LangGraph
     initial_state: CurriculumState = {
