@@ -99,15 +99,21 @@ async def generate_from_pdf(
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="يجب رفع ملف PDF")
     
+    # 1. استخراج النص من PDF
     try:
         pdf_bytes = await file.read()
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            full_text = "".join([page.extract_text() or "" for page in pdf.pages])
+            full_text = ""
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    full_text += text + "\n"
         if len(full_text.strip()) < 100:
-            raise HTTPException(status_code=400, detail="النص المستخرج قصير جداً")
+            raise HTTPException(status_code=400, detail="النص المستخرج قصير جداً (أقل من 100 حرف)")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"فشل استخراج النص: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"فشل استخراج النص من PDF: {str(e)}")
     
+    # 2. تشغيل وكلاء المنهج
     initial_state: CurriculumState = {
         "book_text": full_text,
         "level": level,
