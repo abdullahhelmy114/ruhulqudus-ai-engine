@@ -7,6 +7,7 @@ import uvicorn
 import pdfplumber
 from langgraph.graph import StateGraph, END
 from openai import AsyncOpenAI
+import traceback  
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "your-free-key")
 BASE_URL = "https://openrouter.ai/api/v1"
@@ -90,6 +91,7 @@ def create_curriculum_graph():
 curriculum_graph = create_curriculum_graph()
 
 # نقطة النهاية الجديدة التي تستقبل ملف PDF
+
 @app.post("/generate-from-pdf")
 async def generate_from_pdf(
     file: UploadFile = File(...),
@@ -111,9 +113,10 @@ async def generate_from_pdf(
         if len(full_text.strip()) < 100:
             raise HTTPException(status_code=400, detail="النص المستخرج قصير جداً (أقل من 100 حرف)")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"فشل استخراج النص من PDF: {str(e)}")
+        traceback.print_exc()  # يطبع الخطأ في السجلات
+        raise HTTPException(status_code=500, detail=f"فشل استخراج النص: {str(e)}")
     
-    # 2. تشغيل وكلاء المنهج
+    # 2. تشغيل وكلاء LangGraph
     initial_state: CurriculumState = {
         "book_text": full_text,
         "level": level,
@@ -132,6 +135,7 @@ async def generate_from_pdf(
             "titles": final_state["titles"]
         }
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"فشل توليد المنهج: {str(e)}")
 
 @app.get("/")
