@@ -10,8 +10,10 @@ import re
 import io
 import json
 import traceback
-from typing import TypedDict, List
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+import uuid
+import asyncio
+from typing import TypedDict, List, Dict, Optional
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -45,14 +47,19 @@ class CurriculumState(TypedDict):
     assessments: List[str]
     final_markdown: str
 
-# ---------- نموذج الطلب ----------
+# ---------- نموذج الطلب للواجهة القديمة ----------
 class CurriculumRequest(BaseModel):
     book_text: str
     level: str
     instructions: str = ""
 
+# ---------- هيكل تخزين المهام ----------
+class TaskInfo(BaseModel):
+    status: str  # "processing", "completed", "failed"
+    result: Optional[dict] = None
+
 # ---------- إعداد تطبيق FastAPI ----------
-app = FastAPI(title="AI Curriculum Generator", version="3.0")
+app = FastAPI(title="AI Curriculum Generator", version="4.0")
 
 # حماية CORS: السماح فقط لتطبيق Next.js
 app.add_middleware(
@@ -62,6 +69,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# تخزين المهام المؤقت (في الذاكرة)
+tasks_store: Dict[str, TaskInfo] = {}
 
 # ---------- دالة مساعدة لتنظيف استخراج JSON ----------
 def extract_json(text: str) -> dict:
@@ -83,6 +93,32 @@ def extract_json(text: str) -> dict:
                     sliced = cleaned[start_idx:end_idx+1]
                     return json.loads(sliced)
             raise
+
+# ---------- دالة ذكية لإعادة المحاولة عند خطأ 429 ----------
+async def safe_openrouter_call(model: str, messages: list, max_tokens: int = 1500, temperature: float = 0.7):
+    """تنفيذ استدعاء OpenRouter مع إعادة المحاولة عند تجاوز الحد."""
+    for attempt in range(5):  # حتى 5 محاولات
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str:
+                # استخراج مدة الانتظار المقترحة من رسالة الخطأ إن وجدت
+                wait_time = 30  # افتراضي 30 ثانية
+                # محاولة قراءة retry-after من النص
+                # يمكن تحسينها لاحقًا
+                print(f"Rate limited for {model}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                raise
+    raise Exception(f"فشل الاتصال بالنموذج {model} بعد عدة محاولات")
 
 # ---------- دوال الوكلاء (Agents) ----------
 
@@ -109,12 +145,12 @@ async def strategist_agent(state: CurriculumState) -> CurriculumState:
 نص الكتاب (أول 15000 حرف):
 {state['book_text'][:15000]}
 """
-    response = await client.chat.completions.create(
+    raw = await safe_openrouter_call(
         model=AGENT_MODELS["strategist"],
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
+        max_tokens=1500,
     )
-    raw = response.choices[0].message.content
     try:
         data = extract_json(raw)
         state["parts"] = data["parts"]
@@ -138,12 +174,12 @@ async def titler_agent(state: CurriculumState) -> CurriculumState:
   "titles": ["العنوان 1", "العنوان 2", ...]
 }}
 """
-    response = await client.chat.completions.create(
+    raw = await safe_openrouter_call(
         model=AGENT_MODELS["titler"],
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
+        max_tokens=1000,
     )
-    raw = response.choices[0].message.content
     try:
         data = extract_json(raw)
         state["titles"] = data["titles"]
@@ -172,13 +208,15 @@ async def explainer_agent(state: CurriculumState) -> CurriculumState:
 
 أعد الشرح فقط، بدون مقدمات.
 """
-        resp = await client.chat.completions.create(
+        resp_text = await safe_openrouter_call(
             model=AGENT_MODELS["explainer"],
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=2000,  # شرح وافي
+            max_tokens=2000,
         )
-        explanations.append(resp.choices[0].message.content)
+        explanations.append(resp_text)
+        # إضافة تأخير بسيط لتخفيف الضغط على OpenRouter المجاني
+        await asyncio.sleep(1)
     state["explanations"] = explanations
     return state
 
@@ -197,13 +235,14 @@ async def assessor_agent(state: CurriculumState) -> CurriculumState:
 أنشئ 3-4 أسئلة متنوعة (اختيار من متعدد، صح وخطأ، سؤال مقالي قصير) مع الإجابات الصحيحة ونقاط التقييم.
 قدم الأسئلة بتنسيق Markdown واضح.
 """
-        resp = await client.chat.completions.create(
+        resp_text = await safe_openrouter_call(
             model=AGENT_MODELS["assessor"],
             messages=[{"role": "user", "content": prompt}],
             temperature=0.8,
             max_tokens=1500,
         )
-        assessments.append(resp.choices[0].message.content)
+        assessments.append(resp_text)
+        await asyncio.sleep(1)
     state["assessments"] = assessments
     return state
 
@@ -241,37 +280,8 @@ def create_curriculum_graph():
 # تهيئة الرسم البياني
 curriculum_graph = create_curriculum_graph()
 
-# ---------- نقطة النهاية لاستقبال PDF مباشرة ----------
-@app.post("/generate-from-pdf")
-async def generate_from_pdf(
-    file: UploadFile = File(...),
-    level: str = Form(...),
-    instructions: str = Form("")
-):
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="يجب رفع ملف PDF")
-    
-    # 1. استخراج النص من PDF
-    try:
-        pdf_bytes = await file.read()
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            full_text = ""
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
-        # تسجيل النص المستخرج للتشخيص
-        print(f"[PDF Extract] Total chars: {len(full_text.strip())}")
-        print(f"[PDF Extract] First 200 chars: {full_text.strip()[:200]}")
-        if len(full_text.strip()) < 100:
-            raise HTTPException(status_code=400, detail="النص المستخرج قصير جداً (أقل من 100 حرف)")
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"فشل استخراج النص: {str(e)}")
-    
-    # 2. تشغيل وكلاء LangGraph
+# ---------- معالجة المهمة في الخلفية ----------
+async def process_curriculum_background(task_id: str, full_text: str, level: str, instructions: str):
     initial_state: CurriculumState = {
         "book_text": full_text,
         "level": level,
@@ -284,14 +294,61 @@ async def generate_from_pdf(
     }
     try:
         final_state = await curriculum_graph.ainvoke(initial_state)
-        return {
-            "success": True,
-            "markdown": final_state["final_markdown"],
-            "titles": final_state["titles"]
-        }
+        tasks_store[task_id] = TaskInfo(
+            status="completed",
+            result={
+                "success": True,
+                "markdown": final_state["final_markdown"],
+                "titles": final_state["titles"]
+            }
+        )
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"فشل توليد المنهج: {str(e)}")
+        tasks_store[task_id] = TaskInfo(
+            status="failed",
+            result={"success": False, "detail": str(e)}
+        )
+
+# ---------- نقطة النهاية لاستقبال PDF مباشرة ----------
+@app.post("/generate-from-pdf")
+async def generate_from_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    level: str = Form(...),
+    instructions: str = Form("")
+):
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="يجب رفع ملف PDF")
+    
+    # استخراج النص
+    try:
+        pdf_bytes = await file.read()
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            full_text = "".join([page.extract_text() or "" for page in pdf.pages])
+        if len(full_text.strip()) < 100:
+            raise HTTPException(status_code=400, detail="النص المستخرج قصير جداً (أقل من 100 حرف)")
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"فشل استخراج النص: {str(e)}")
+    
+    # إنشاء task_id
+    task_id = str(uuid.uuid4())
+    tasks_store[task_id] = TaskInfo(status="processing", result=None)
+
+    # تشغيل المهمة في الخلفية
+    background_tasks.add_task(process_curriculum_background, task_id, full_text, level, instructions)
+
+    return {"success": True, "task_id": task_id, "message": "جاري معالجة المنهج في الخلفية"}
+
+# ---------- نقطة نهاية لفحص حالة المهمة ----------
+@app.get("/task-status/{task_id}")
+async def get_task_status(task_id: str):
+    task = tasks_store.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="المهمة غير موجودة")
+    return task
 
 # ---------- نقطة النهاية القديمة (للتوافق) ----------
 @app.post("/generate-curriculum")
@@ -324,7 +381,7 @@ async def generate_curriculum(req: CurriculumRequest):
 
 @app.get("/")
 async def root():
-    return {"status": "AI Curriculum Generator Running", "version": "3.0"}
+    return {"status": "AI Curriculum Generator Running", "version": "4.0"}
 
 # ---------- التشغيل ----------
 if __name__ == "__main__":
