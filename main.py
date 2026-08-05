@@ -1,19 +1,14 @@
 """
 خدمة وكلاء الذكاء الاصطناعي لتوليد المناهج التعليمية (LangGraph + FastAPI)
-النماذج المستخدمة مجانية بالكامل عبر OpenRouter:
-- Google Gemma 4 26B (A4B) للتخطيط والعناوين
-- Google Gemma 4 31B للشرح والتقييم
+- استخراج النص من PDF محلياً عبر pdfplumber
+- توليد المنهج عبر وكلاء متسلسلين (OpenRouter - نماذج مجانية)
+- معالجة خلفية مع استعلام عن الحالة
+- إعادة المحاولة التلقائية عند تجاوز الحد (429)
 """
 
-import os
-import re
-import io
-import json
-import traceback
-import uuid
-import asyncio
-from typing import TypedDict, List, Dict, Optional
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+import os, re, io, json, traceback, uuid, asyncio
+from typing import TypedDict, List, Optional
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -21,22 +16,20 @@ import pdfplumber
 from langgraph.graph import StateGraph, END
 from openai import AsyncOpenAI
 
-# ---------- إعداد OpenRouter (مفتاح واحد لجميع النماذج) ----------
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "your-free-key")
+# ---------- إعداد OpenRouter ----------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 BASE_URL = "https://openrouter.ai/api/v1"
-
-# إعداد عميل OpenAI متوافق مع OpenRouter
 client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=BASE_URL)
 
-# ---------- النماذج المتخصصة لكل وكيل (جميعها مجانية) ----------
+# ---------- النماذج المتخصصة ----------
 AGENT_MODELS = {
-    "strategist": "google/gemma-4-26b-a4b-it:free",  # تحليل هيكلي وتخطيط JSON دقيق
-    "titler": "google/gemma-4-26b-a4b-it:free",      # صياغة عناوين دقيقة ومنظمة
-    "explainer": "google/gemma-4-31b-it:free",       # شرح عربي غني ومبسط
-    "assessor": "google/gemma-4-31b-it:free",        # أسئلة تقييمية إبداعية
+    "strategist": "google/gemma-4-26b-a4b-it:free",
+    "titler": "google/gemma-4-26b-a4b-it:free",
+    "explainer": "google/gemma-4-31b-it:free",
+    "assessor": "google/gemma-4-31b-it:free",
 }
 
-# ---------- تعريف الحالة (State) المتنقلة بين الوكلاء ----------
+# ---------- الحالة ----------
 class CurriculumState(TypedDict):
     book_text: str
     level: str
@@ -47,21 +40,14 @@ class CurriculumState(TypedDict):
     assessments: List[str]
     final_markdown: str
 
-# ---------- نموذج الطلب للواجهة القديمة ----------
 class CurriculumRequest(BaseModel):
     book_text: str
     level: str
     instructions: str = ""
 
-# ---------- هيكل تخزين المهام ----------
-class TaskInfo(BaseModel):
-    status: str  # "processing", "completed", "failed"
-    result: Optional[dict] = None
-
-# ---------- إعداد تطبيق FastAPI ----------
+# ---------- تطبيق FastAPI ----------
 app = FastAPI(title="AI Curriculum Generator", version="4.0")
 
-# حماية CORS: السماح فقط لتطبيق Next.js
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://ruhulqudus.net"],
@@ -70,12 +56,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# تخزين المهام المؤقت (في الذاكرة)
-tasks_store: Dict[str, TaskInfo] = {}
+# تخزين المهام الخلفية
+tasks_store: dict[str, dict] = {}
 
-# ---------- دالة مساعدة لتنظيف استخراج JSON ----------
+# ---------- دوال مساعدة ----------
 def extract_json(text: str) -> dict:
-    """محاولة استخراج JSON من رد النموذج، مع تنظيف الشوائب."""
+    """تنظيف ردود النماذج لاستخراج JSON."""
     try:
         return json.loads(text)
     except:
@@ -83,47 +69,53 @@ def extract_json(text: str) -> dict:
         try:
             return json.loads(cleaned)
         except:
-            start_idx = min(
+            start = min(
                 (cleaned.find('{') if cleaned.find('{') != -1 else float('inf')),
                 (cleaned.find('[') if cleaned.find('[') != -1 else float('inf'))
             )
-            if start_idx != float('inf'):
-                end_idx = max(cleaned.rfind('}'), cleaned.rfind(']'))
-                if end_idx != -1:
-                    sliced = cleaned[start_idx:end_idx+1]
-                    return json.loads(sliced)
+            if start != float('inf'):
+                end = max(cleaned.rfind('}'), cleaned.rfind(']'))
+                if end != -1:
+                    return json.loads(cleaned[start:end+1])
             raise
 
-# ---------- دالة ذكية لإعادة المحاولة عند خطأ 429 ----------
-async def safe_openrouter_call(model: str, messages: list, max_tokens: int = 1500, temperature: float = 0.7):
-    """تنفيذ استدعاء OpenRouter مع إعادة المحاولة عند تجاوز الحد."""
-    for attempt in range(5):  # حتى 5 محاولات
+async def call_with_retry(
+    model_name: str,
+    messages: list,
+    temperature: float,
+    max_tokens: Optional[int] = None,
+    max_retries: int = 5
+) -> str:
+    """استدعاء OpenRouter مع إعادة المحاولة عند 429."""
+    last_error = None
+    for attempt in range(max_retries):
         try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return response.choices[0].message.content
+            kwargs = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if max_tokens:
+                kwargs["max_tokens"] = max_tokens
+            resp = await client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content
         except Exception as e:
-            error_str = str(e)
-            if "429" in error_str:
-                # استخراج مدة الانتظار المقترحة من رسالة الخطأ إن وجدت
-                wait_time = 30  # افتراضي 30 ثانية
-                # محاولة قراءة retry-after من النص
-                # يمكن تحسينها لاحقًا
-                print(f"Rate limited for {model}. Retrying in {wait_time}s...")
-                await asyncio.sleep(wait_time)
-                continue
+            last_error = e
+            err_str = str(e)
+            if "429" in err_str:
+                # محاولة استخراج وقت الانتظار من الرسالة
+                retry_after = 60
+                match = re.search(r"retry in (\d+)s", err_str)
+                if match:
+                    retry_after = int(match.group(1))
+                print(f"⚠️ Rate limited on {model_name}. Retry in {retry_after}s (attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(retry_after + 5)
             else:
-                raise
-    raise Exception(f"فشل الاتصال بالنموذج {model} بعد عدة محاولات")
+                raise  # خطأ غير 429، نوقفه فورًا
+    raise last_error
 
-# ---------- دوال الوكلاء (Agents) ----------
-
+# ---------- الوكلاء ----------
 async def strategist_agent(state: CurriculumState) -> CurriculumState:
-    """الوكيل المخطط: يقسم الكتاب إلى 10 أجزاء تعليمية منطقية"""
     prompt = f"""
 أنت خبير تعليمي في تصميم المناهج. الكتاب التالي لتعليم العربية والعلوم الإسلامية.
 المستوى التعليمي: {state['level']}.
@@ -145,12 +137,7 @@ async def strategist_agent(state: CurriculumState) -> CurriculumState:
 نص الكتاب (أول 15000 حرف):
 {state['book_text'][:15000]}
 """
-    raw = await safe_openrouter_call(
-        model=AGENT_MODELS["strategist"],
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=1500,
-    )
+    raw = await call_with_retry(AGENT_MODELS["strategist"], [{"role": "user", "content": prompt}], 0.3)
     try:
         data = extract_json(raw)
         state["parts"] = data["parts"]
@@ -159,7 +146,6 @@ async def strategist_agent(state: CurriculumState) -> CurriculumState:
     return state
 
 async def titler_agent(state: CurriculumState) -> CurriculumState:
-    """وكيل العناوين: صياغة عناوين جذابة ومناسبة تربوياً"""
     parts = state["parts"]
     prompt = f"""
 أنت مؤلف مناهج مبدع. الأجزاء العشرة للدورة هي:
@@ -174,12 +160,7 @@ async def titler_agent(state: CurriculumState) -> CurriculumState:
   "titles": ["العنوان 1", "العنوان 2", ...]
 }}
 """
-    raw = await safe_openrouter_call(
-        model=AGENT_MODELS["titler"],
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        max_tokens=1000,
-    )
+    raw = await call_with_retry(AGENT_MODELS["titler"], [{"role": "user", "content": prompt}], 0.7)
     try:
         data = extract_json(raw)
         state["titles"] = data["titles"]
@@ -188,7 +169,6 @@ async def titler_agent(state: CurriculumState) -> CurriculumState:
     return state
 
 async def explainer_agent(state: CurriculumState) -> CurriculumState:
-    """وكيل الشرح: كتابة شروحات تفصيلية بأسلوب تربوي"""
     titles = state["titles"]
     parts = state["parts"]
     explanations = []
@@ -208,20 +188,12 @@ async def explainer_agent(state: CurriculumState) -> CurriculumState:
 
 أعد الشرح فقط، بدون مقدمات.
 """
-        resp_text = await safe_openrouter_call(
-            model=AGENT_MODELS["explainer"],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=2000,
-        )
-        explanations.append(resp_text)
-        # إضافة تأخير بسيط لتخفيف الضغط على OpenRouter المجاني
-        await asyncio.sleep(1)
+        text = await call_with_retry(AGENT_MODELS["explainer"], [{"role": "user", "content": prompt}], 0.7, max_tokens=2000)
+        explanations.append(text)
     state["explanations"] = explanations
     return state
 
 async def assessor_agent(state: CurriculumState) -> CurriculumState:
-    """وكيل التقييم: توليد أسئلة تقييمية لكل درس"""
     titles = state["titles"]
     explanations = state["explanations"]
     assessments = []
@@ -235,19 +207,12 @@ async def assessor_agent(state: CurriculumState) -> CurriculumState:
 أنشئ 3-4 أسئلة متنوعة (اختيار من متعدد، صح وخطأ، سؤال مقالي قصير) مع الإجابات الصحيحة ونقاط التقييم.
 قدم الأسئلة بتنسيق Markdown واضح.
 """
-        resp_text = await safe_openrouter_call(
-            model=AGENT_MODELS["assessor"],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.8,
-            max_tokens=1500,
-        )
-        assessments.append(resp_text)
-        await asyncio.sleep(1)
+        text = await call_with_retry(AGENT_MODELS["assessor"], [{"role": "user", "content": prompt}], 0.8, max_tokens=1500)
+        assessments.append(text)
     state["assessments"] = assessments
     return state
 
 async def formatter_agent(state: CurriculumState) -> CurriculumState:
-    """وكيل التنسيق: تجميع المنهج النهائي في Markdown (بدون LLM)"""
     titles = state["titles"]
     explanations = state["explanations"]
     assessments = state["assessments"]
@@ -259,7 +224,7 @@ async def formatter_agent(state: CurriculumState) -> CurriculumState:
     state["final_markdown"] = md
     return state
 
-# ---------- بناء الرسم البياني (Graph) ----------
+# ---------- بناء الرسم البياني ----------
 def create_curriculum_graph():
     workflow = StateGraph(CurriculumState)
     workflow.add_node("strategist", strategist_agent)
@@ -274,15 +239,13 @@ def create_curriculum_graph():
     workflow.add_edge("explainer", "assessor")
     workflow.add_edge("assessor", "formatter")
     workflow.add_edge("formatter", END)
-
     return workflow.compile()
 
-# تهيئة الرسم البياني
 curriculum_graph = create_curriculum_graph()
 
-# ---------- معالجة المهمة في الخلفية ----------
+# ---------- مهمة خلفية ----------
 async def process_curriculum_background(task_id: str, full_text: str, level: str, instructions: str):
-    initial_state: CurriculumState = {
+    state: CurriculumState = {
         "book_text": full_text,
         "level": level,
         "instructions": instructions,
@@ -293,23 +256,24 @@ async def process_curriculum_background(task_id: str, full_text: str, level: str
         "final_markdown": ""
     }
     try:
-        final_state = await curriculum_graph.ainvoke(initial_state)
-        tasks_store[task_id] = TaskInfo(
-            status="completed",
-            result={
+        final_state = await curriculum_graph.ainvoke(state)
+        tasks_store[task_id] = {
+            "status": "completed",
+            "result": {
                 "success": True,
                 "markdown": final_state["final_markdown"],
                 "titles": final_state["titles"]
             }
-        )
+        }
     except Exception as e:
+        print(f"Background task {task_id} failed: {e}")
         traceback.print_exc()
-        tasks_store[task_id] = TaskInfo(
-            status="failed",
-            result={"success": False, "detail": str(e)}
-        )
+        tasks_store[task_id] = {
+            "status": "failed",
+            "result": {"detail": str(e)}
+        }
 
-# ---------- نقطة النهاية لاستقبال PDF مباشرة ----------
+# ---------- نقاط النهاية ----------
 @app.post("/generate-from-pdf")
 async def generate_from_pdf(
     background_tasks: BackgroundTasks,
@@ -319,30 +283,29 @@ async def generate_from_pdf(
 ):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="يجب رفع ملف PDF")
-    
-    # استخراج النص
+
+    # 1. استخراج النص
     try:
         pdf_bytes = await file.read()
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            full_text = "".join([page.extract_text() or "" for page in pdf.pages])
-        if len(full_text.strip()) < 100:
+            full_text = "".join(page.extract_text() or "" for page in pdf.pages)
+        clean_text = full_text.strip()
+        if len(clean_text) < 100:
             raise HTTPException(status_code=400, detail="النص المستخرج قصير جداً (أقل من 100 حرف)")
     except HTTPException:
         raise
     except Exception as e:
+        print("PDF extraction error:", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"فشل استخراج النص: {str(e)}")
-    
-    # إنشاء task_id
+
+    # 2. بدء مهمة خلفية
     task_id = str(uuid.uuid4())
-    tasks_store[task_id] = TaskInfo(status="processing", result=None)
+    tasks_store[task_id] = {"status": "processing", "result": None}
+    background_tasks.add_task(process_curriculum_background, task_id, clean_text, level, instructions)
 
-    # تشغيل المهمة في الخلفية
-    background_tasks.add_task(process_curriculum_background, task_id, full_text, level, instructions)
+    return {"success": True, "task_id": task_id}
 
-    return {"success": True, "task_id": task_id, "message": "جاري معالجة المنهج في الخلفية"}
-
-# ---------- نقطة نهاية لفحص حالة المهمة ----------
 @app.get("/task-status/{task_id}")
 async def get_task_status(task_id: str):
     task = tasks_store.get(task_id)
@@ -350,16 +313,14 @@ async def get_task_status(task_id: str):
         raise HTTPException(status_code=404, detail="المهمة غير موجودة")
     return task
 
-# ---------- نقطة النهاية القديمة (للتوافق) ----------
 @app.post("/generate-curriculum")
 async def generate_curriculum(req: CurriculumRequest):
     if not req.book_text or not req.level:
         raise HTTPException(status_code=400, detail="يجب توفير نص الكتاب والمستوى التعليمي")
-    
     if len(req.book_text) < 500:
-        raise HTTPException(status_code=400, detail="نص الكتاب قصير جداً (أقل من 500 حرف)")
+        raise HTTPException(status_code=400, detail="نص الكتاب قصير جداً")
 
-    initial_state: CurriculumState = {
+    state: CurriculumState = {
         "book_text": req.book_text,
         "level": req.level,
         "instructions": req.instructions,
@@ -370,12 +331,8 @@ async def generate_curriculum(req: CurriculumRequest):
         "final_markdown": ""
     }
     try:
-        final_state = await curriculum_graph.ainvoke(initial_state)
-        return {
-            "success": True,
-            "markdown": final_state["final_markdown"],
-            "titles": final_state["titles"]
-        }
+        final_state = await curriculum_graph.ainvoke(state)
+        return {"success": True, "markdown": final_state["final_markdown"], "titles": final_state["titles"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"فشل توليد المنهج: {str(e)}")
 
@@ -383,6 +340,6 @@ async def generate_curriculum(req: CurriculumRequest):
 async def root():
     return {"status": "AI Curriculum Generator Running", "version": "4.0"}
 
-# ---------- التشغيل ----------
+# ---------- تشغيل ----------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
